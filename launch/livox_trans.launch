@@ -1,0 +1,15 @@
+<launch>
+  <!-- 你的 Livox PointCloud2 话题 -->
+  <!-- <node pkg="livox_ros_driver2" type="..."/> -->
+
+  <node pkg="fast_lio" type="fast_lio_livox_to_liosam" name="fast_lio_livox_to_liosam" output="screen">
+    <param name="in_cloud" value="/lidar"/>
+    <param name="out_cloud" value="/points_raw"/>      <!-- LIO-SAM 默认订阅的名字常见是这个 -->
+    <param name="N_SCAN" value="32"/>                  <!-- 按你的 LIO-SAM 配置 -->
+    <param name="ang_min_deg" value="-25"/>           <!-- 俯仰角范围，需依据机型/安装调好 -->
+    <param name="ang_max_deg" value="70"/>
+    <param name="drop_out_of_fov" value="true"/>
+    <param name="scan_period" value="0.1"/>           <!-- 若无time字段用它合成 -->
+    <param name="time_field_name" value="time"/>      <!-- 输入里的 per-point 时间字段名（有就用） -->
+  </node>
+</launch>

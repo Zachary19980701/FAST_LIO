@@ -281,6 +281,13 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
     mtx_buffer.lock();
     scan_count ++;
     double preprocess_start_time = omp_get_wtime();
+    
+    // 添加调试输出
+    ROS_INFO_STREAM("[标准LIDAR回调] 接收到点云数据: " 
+                    << "时间戳: " << msg->header.stamp.toSec() 
+                    << ", 序列号: " << scan_count 
+                    << ", 帧ID: " << msg->header.frame_id);
+    
     if (msg->header.stamp.toSec() < last_timestamp_lidar)
     {
         ROS_ERROR("lidar loop back, clear buffer");
@@ -293,6 +300,12 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
     time_buffer.push_back(msg->header.stamp.toSec());
     last_timestamp_lidar = msg->header.stamp.toSec();
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    
+    // 添加处理统计信息
+    ROS_INFO_STREAM("[标准LIDAR回调] 处理完成: " 
+                    << "点云点数: " << ptr->points.size() 
+                    << ", 缓冲区大小: " << lidar_buffer.size());
+    
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -304,6 +317,14 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
     mtx_buffer.lock();
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
+    
+    // 添加调试输出
+    ROS_INFO_STREAM("[Livox LIDAR回调] 接收到点云数据: " 
+                    << "时间戳: " << msg->header.stamp.toSec() 
+                    << ", 序列号: " << scan_count 
+                    << ", 帧ID: " << msg->header.frame_id
+                    << ", 点数量: " << msg->point_num);
+    
     if (msg->header.stamp.toSec() < last_timestamp_lidar)
     {
         ROS_ERROR("lidar loop back, clear buffer");
@@ -321,6 +342,7 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
         timediff_set_flg = true;
         timediff_lidar_wrt_imu = last_timestamp_lidar + 0.1 - last_timestamp_imu;
         printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu);
+        ROS_INFO_STREAM("[Livox LIDAR回调] 时间同步设置完成，时间差值: " << timediff_lidar_wrt_imu);
     }
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
@@ -329,6 +351,12 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
     time_buffer.push_back(last_timestamp_lidar);
     
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    
+    // 添加处理统计信息
+    ROS_INFO_STREAM("[Livox LIDAR回调] 处理完成: " 
+                    << "处理点数: " << ptr->points.size() 
+                    << ", 缓冲区大小: " << lidar_buffer.size());
+    
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -336,7 +364,19 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
 void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in) 
 {
     publish_count ++;
-    // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
+    
+    // 添加IMU数据调试输出
+    ROS_INFO_STREAM("[IMU回调] 接收到IMU数据: " 
+                    << "原始时间戳: " << msg_in->header.stamp.toSec() 
+                    << ", 发布计数: " << publish_count 
+                    << ", 帧ID: " << msg_in->header.frame_id
+                    << ", 加速度: (" << msg_in->linear_acceleration.x << ", "
+                    << msg_in->linear_acceleration.y << ", "
+                    << msg_in->linear_acceleration.z << ")"
+                    << ", 角速度: (" << msg_in->angular_velocity.x << ", "
+                    << msg_in->angular_velocity.y << ", "
+                    << msg_in->angular_velocity.z << ")");
+    
     sensor_msgs::Imu::Ptr msg(new sensor_msgs::Imu(*msg_in));
 
     msg->header.stamp = ros::Time().fromSec(msg_in->header.stamp.toSec() - time_diff_lidar_to_imu);
@@ -359,6 +399,12 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
     last_timestamp_imu = timestamp;
 
     imu_buffer.push_back(msg);
+    
+    // 添加IMU缓冲区状态输出
+    ROS_INFO_STREAM("[IMU回调] IMU数据存入缓冲区: " 
+                    << "调整后时间戳: " << timestamp 
+                    << ", 当前缓冲区大小: " << imu_buffer.size());
+    
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
