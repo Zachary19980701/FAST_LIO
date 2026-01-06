@@ -26,7 +26,7 @@
 #include "preprocess.h"
 
 /// *************Preconfiguration
-
+// IMU的预处理模块
 #define MAX_INI_COUNT (10)
 
 const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};

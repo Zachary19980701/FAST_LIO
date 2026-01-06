@@ -1,4 +1,14 @@
 ## Related Works and Extended Application
+## Zachary Learning Version
+**介绍**
+这是Zachary的学习注释版本
+
+## CHANGELOG
+**v1.0.0**
+新增了点云的处理程序，能够使用pcd2的格式，直接使用现有的数据集
+去除了ikdTree的子仓库设置，直接下载就能编译通过
+
+
 
 **SLAM:**
 
