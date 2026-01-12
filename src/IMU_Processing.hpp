@@ -156,27 +156,51 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a)
   cov_bias_acc = b_a;
 }
 
+//初始化过程持续 MAX_INI_COUNT（默认10）帧数据
+// 每帧数据都会更新均值和协方差的估计
+// 迭代完成后，初始化标志 imu_need_init_ 设为false
 void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
 {
+  // 初始化IMU 的 重力，陀螺仪bias，加速度和陀螺仪的协方差
+  // 在接受到雷达和IMU的数据之后，将lidar buffer和IMU buffer的数据拿出来进行初始化
+  // LiDAR数据通过 laserCloudHandler 回调函数接收并缓存到 lidar_buffer
+  // IMU数据通过 imu_cbk 回调函数接收并缓存到 imu_buffer
+
+
+  // 这个程序主要需要完成下面的任务
+  // 重力向量估计：
+  // 计算所有IMU加速度数据的均值 mean_acc
+  // 利用 mean_acc 的方向确定重力向量方向（取反并归一化到标准重力值）
+  // 陀螺仪偏置估计：
+  // 计算所有IMU角速度数据的均值 mean_gyr
+  // 将此均值作为陀螺仪的零偏初始值
+  // 协方差估计：
+  // 实时计算IMU加速度和角速度的协方差矩阵
+  // 用于后续EKF滤波过程的噪声协方差设置
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
    ** 2. normalize the acceleration measurenments to unit gravity **/
   
-  V3D cur_acc, cur_gyr;
+  V3D cur_acc, cur_gyr; // 创建当前加速度和角速度变量
   
-  if (b_first_frame_)
-  {
-    Reset();
-    N = 1;
-    b_first_frame_ = false;
-    const auto &imu_acc = meas.imu.front()->linear_acceleration;
-    const auto &gyr_acc = meas.imu.front()->angular_velocity;
+  if (b_first_frame_) // 如果是第一帧
+  { 
+    Reset(); // 重置IMU处理模块
+    N = 1; // 初始化计数器
+    b_first_frame_ = false; // 设置第一帧标志为false
+    const auto &imu_acc = meas.imu.front()->linear_acceleration; // 获取第一个IMU测量的线性加速度
+    const auto &gyr_acc = meas.imu.front()->angular_velocity; // 获取第一个IMU测量的角速度
+    
+    // 将加速度和角速度赋值给均值变量
     mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
-    first_lidar_time = meas.lidar_beg_time;
+    first_lidar_time = meas.lidar_beg_time; // 记录第一个激光雷达时间戳
   }
 
+  // 计算加速度和角速度的均值和协方差
+  // 在线估计加速度和角速度的均值和协方差，用于初始化IMU状态
   for (const auto &imu : meas.imu)
   {
+    // 将当前雷达帧的IMU的数据拿出来进行处理
     const auto &imu_acc = imu->linear_acceleration;
     const auto &gyr_acc = imu->angular_velocity;
     cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
@@ -192,15 +216,18 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
 
     N ++;
   }
-  state_ikfom init_state = kf_state.get_x();
-  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
+  state_ikfom init_state = kf_state.get_x(); // 获取当前状态估计
+  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2); // 用加速度反推重力方向
   
   //state_inout.rot = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
-  init_state.bg  = mean_gyr;
+  init_state.bg  = mean_gyr; // 陀螺仪零偏初始化为角速度均值
+
+  // 设置初始状态的激光雷达与IMU的外参
   init_state.offset_T_L_I = Lidar_T_wrt_IMU;
   init_state.offset_R_L_I = Lidar_R_wrt_IMU;
   kf_state.change_x(init_state);
 
+  // 设置EKF的初始协方差矩阵
   esekfom::esekf<state_ikfom, 12, input_ikfom>::cov init_P = kf_state.get_P();
   init_P.setIdentity();
   init_P(6,6) = init_P(7,7) = init_P(8,8) = 0.00001;
@@ -215,9 +242,16 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
 
 void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
 {
+  // READHERE
   /*** add the imu of the last frame-tail to the of current frame-head ***/
-  auto v_imu = meas.imu;
-  v_imu.push_front(last_imu_);
+  // 使用IMU数据对Lidar点云进行运动补偿
+  // void ImuProcess::UndistortPcl(
+  //  const MeasureGroup &meas,                        // 输入：包含当前 LiDAR 扫描点云和对应 IMU 数据的测量组
+  //  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, // 输入/输出：EKF 状态（会被预测更新）
+  //  PointCloudXYZI &pcl_out                          // 输出：经过运动补偿（去畸变）后的点云
+  // );
+  auto v_imu = meas.imu; // 复制当前测量组的IMU数据
+  v_imu.push_front(last_imu_); // 将上一帧的最后一个 IMU 数据添加到序列开头
   const double &imu_beg_time = v_imu.front()->header.stamp.toSec();
   const double &imu_end_time = v_imu.back()->header.stamp.toSec();
 
