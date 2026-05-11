@@ -8,6 +8,12 @@
 新增了点云的处理程序，能够使用pcd2的格式，直接使用现有的数据集
 去除了ikdTree的子仓库设置，直接下载就能编译通过
 
+使用无时间戳离线数据包进行建图测试：
+1. 启动雷达转换节点 `roslaunch fast_lio livox_trans.launch`
+2. 播放数据包 `rosbag play your_bag.bag`
+3. 启动veledyne模式进行fastlio进行建图 `roslaunch fast_lio mapping_velodyne.launch`
+
+
 
 
 **SLAM:**
