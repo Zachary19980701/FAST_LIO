@@ -66,6 +66,7 @@
 #include "pcd_stream_writer.h"
 #include "tiled_voxel_map_writer.h"
 #include "map_save_keyframe.h"
+#include "keyframe_pose_writer.h"
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -575,44 +576,7 @@ PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 std::unique_ptr<PcdStreamWriter<PointType>> pcd_stream;
 std::unique_ptr<TiledVoxelMapWriter> tiled_map_writer;
 std::unique_ptr<MapSaveKeyframe> save_keyframe_selector;
-
-void save_lightweight_map_frame()
-{
-    try
-    {
-        if (!save_keyframe_selector->select(pos_lid, Eigen::Quaterniond(state_point.rot.toRotationMatrix()), lidar_end_time))
-        {
-            ++save_skipped_frames;
-            return;
-        }
-        PointCloudXYZI sampled;
-        downSizeFilterSave.setInputCloud(feats_undistort);
-        downSizeFilterSave.filter(sampled);
-        pcl::PointCloud<pcl::PointXYZI>::Ptr world(new pcl::PointCloud<pcl::PointXYZI>());
-        world->reserve(sampled.size());
-        const M3D rotation = state_point.rot.toRotationMatrix() * state_point.offset_R_L_I.toRotationMatrix();
-        const V3D translation = state_point.rot * state_point.offset_T_L_I + state_point.pos;
-        for (const auto& point : sampled)
-        {
-            const V3D transformed = rotation * V3D(point.x, point.y, point.z) + translation;
-            pcl::PointXYZI output;
-            output.x = transformed.x();
-            output.y = transformed.y();
-            output.z = transformed.z();
-            output.intensity = point.intensity;
-            world->push_back(output);
-        }
-        // Only selected, downsampled scans enter the bounded writer queue.
-        tiled_map_writer->append(world);
-        ++save_keyframes;
-    }
-    catch (const std::exception& error)
-    {
-        ROS_FATAL("Lightweight map save failed: %s; preserving tile checkpoints", error.what());
-        map_save_failed = true;
-        flg_exit = true;
-    }
-}
+std::unique_ptr<KeyframePoseWriter> keyframe_pose_writer;
 
 bool save_accumulated_map(const string &file_path)
 {
@@ -631,6 +595,81 @@ bool save_accumulated_map(const string &file_path)
     {
         ROS_ERROR("Failed to save map to %s: %s", file_path.c_str(), error.what());
         return false;
+    }
+}
+
+void save_map_frame()
+{
+    try
+    {
+        // Both the saved cloud and pose use T_world_lidar, including extrinsics.
+        const M3D rotation = state_point.rot.toRotationMatrix() * state_point.offset_R_L_I.toRotationMatrix();
+        const V3D translation = state_point.rot * state_point.offset_T_L_I + state_point.pos;
+        const Eigen::Quaterniond orientation(rotation);
+        const bool keyframe = save_keyframe_selector->select(translation, orientation, lidar_end_time);
+        if (tiled_map_writer)
+        {
+            if (!keyframe)
+            {
+                ++save_skipped_frames;
+                return;
+            }
+            PointCloudXYZI sampled;
+            downSizeFilterSave.setInputCloud(feats_undistort);
+            downSizeFilterSave.filter(sampled);
+            pcl::PointCloud<pcl::PointXYZI>::Ptr world(new pcl::PointCloud<pcl::PointXYZI>());
+            world->reserve(sampled.size());
+            for (const auto& point : sampled)
+            {
+                const V3D transformed = rotation * V3D(point.x, point.y, point.z) + translation;
+                pcl::PointXYZI output;
+                output.x = transformed.x();
+                output.y = transformed.y();
+                output.z = transformed.z();
+                output.intensity = point.intensity;
+                world->push_back(output);
+            }
+            // Only selected, downsampled scans enter the bounded writer queue.
+            tiled_map_writer->append(world);
+        }
+        else
+        {
+            PointCloudXYZI world(feats_undistort->size(), 1);
+            for (size_t i = 0; i < world.size(); ++i)
+                RGBpointBodyToWorld(&feats_undistort->points[i], &world[i]);
+            if (pcd_stream) pcd_stream->append(world);
+            else
+            {
+                *pcl_wait_save += world;
+                static int scan_wait_num = 0;
+                ++scan_wait_num;
+                if (!pcl_wait_save->empty() && pcd_save_interval > 0 && scan_wait_num >= pcd_save_interval)
+                {
+                    ++pcd_index;
+                    string prefix = map_file_path;
+                    const size_t dot = prefix.find_last_of('.');
+                    const size_t slash = prefix.find_last_of('/');
+                    if (dot != string::npos && (slash == string::npos || dot > slash)) prefix.resize(dot);
+                    const string file_path = prefix + "_" + to_string(pcd_index) + ".pcd";
+                    if (!save_accumulated_map(file_path))
+                        throw std::runtime_error("Cannot save map chunk " + file_path);
+                    pcl_wait_save.reset(new PointCloudXYZI());
+                    scan_wait_num = 0;
+                }
+            }
+        }
+        if (keyframe)
+        {
+            keyframe_pose_writer->append(translation, orientation, lidar_end_time);
+            ++save_keyframes;
+        }
+        else ++save_skipped_frames;
+    }
+    catch (const std::exception& error)
+    {
+        ROS_FATAL("Map or keyframe pose save failed: %s; preserving checkpoints", error.what());
+        map_save_failed = true;
+        flg_exit = true;
     }
 }
 
@@ -676,6 +715,7 @@ bool save_map_checkpoint(std_srvs::Trigger::Request&, std_srvs::Trigger::Respons
         try
         {
             response.message = tiled_map_writer->checkpoint();
+            keyframe_pose_writer->checkpoint();
             response.success = tiled_map_writer->stats().unique_points > 0;
             if (!response.success) response.message = "No lightweight map points are available yet";
         }
@@ -695,6 +735,7 @@ bool save_map_checkpoint(std_srvs::Trigger::Request&, std_srvs::Trigger::Respons
     try
     {
         pcd_stream->checkpoint();
+        keyframe_pose_writer->checkpoint();
         response.success = true;
         response.message = pcd_stream->workingPath();
     }
@@ -732,54 +773,7 @@ void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. noted that pcd save will influence the real-time performences **/
-    if (pcd_save_en)
-    {
-        if (tiled_map_writer)
-        {
-            save_lightweight_map_frame();
-            return;
-        }
-        int size = feats_undistort->points.size();
-        PointCloudXYZI::Ptr laserCloudWorld( \
-                        new PointCloudXYZI(size, 1));
-
-        for (int i = 0; i < size; i++)
-        {
-            RGBpointBodyToWorld(&feats_undistort->points[i], \
-                                &laserCloudWorld->points[i]);
-        }
-        if (pcd_stream)
-        {
-            try
-            {
-                pcd_stream->append(*laserCloudWorld);
-            }
-            catch (const std::exception& error)
-            {
-                ROS_FATAL("Streaming map save failed: %s; stopping processing to preserve the last checkpoint", error.what());
-                flg_exit = true;
-            }
-            return;
-        }
-        *pcl_wait_save += *laserCloudWorld;
-
-        static int scan_wait_num = 0;
-        scan_wait_num ++;
-        if (pcl_wait_save->size() > 0 && pcd_save_interval > 0  && scan_wait_num >= pcd_save_interval)
-        {
-            pcd_index ++;
-            string prefix = map_file_path;
-            const size_t dot = prefix.find_last_of('.');
-            const size_t slash = prefix.find_last_of('/');
-            if (dot != string::npos && (slash == string::npos || dot > slash)) prefix.resize(dot);
-            const string file_path = prefix + "_" + to_string(pcd_index) + ".pcd";
-            if (save_accumulated_map(file_path))
-            {
-                pcl_wait_save.reset(new PointCloudXYZI());
-                scan_wait_num = 0;
-            }
-        }
-    }
+    if (pcd_save_en) save_map_frame();
 }
 
 void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body)
@@ -1084,18 +1078,33 @@ int main(int argc, char** argv)
     nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
     nh.param<bool>("pcd_save/lightweight_en", lightweight_save_en, false);
+    MapSaveKeyframe::Options keyframe_options;
+    if (pcd_save_en)
+    {
+        nh.param<double>("pcd_save/keyframe_translation", keyframe_options.translation, 0.75);
+        nh.param<double>("pcd_save/keyframe_rotation_deg", keyframe_options.rotation_deg, 10.0);
+        nh.param<double>("pcd_save/keyframe_max_interval", keyframe_options.max_interval, 2.0);
+        try
+        {
+            save_keyframe_selector.reset(new MapSaveKeyframe(keyframe_options));
+            keyframe_pose_writer.reset(new KeyframePoseWriter(map_file_path));
+        }
+        catch (const std::exception& error)
+        {
+            ROS_FATAL("Cannot initialize keyframe pose saving: %s", error.what());
+            return 1;
+        }
+        ROS_INFO("Keyframe LiDAR poses: %s and %s", keyframe_pose_writer->trajectoryPath().c_str(),
+                 keyframe_pose_writer->posesPath().c_str());
+    }
     if (pcd_save_en && lightweight_save_en)
     {
         TiledVoxelMapWriter::Options options;
-        MapSaveKeyframe::Options keyframe_options;
         int active_tiles = 16, queued_points = 200000;
         nh.param<double>("pcd_save/voxel_size", options.voxel_size, 0.25);
         nh.param<double>("pcd_save/tile_size", options.tile_size, 10.0);
         nh.param<int>("pcd_save/max_active_tiles", active_tiles, 16);
         nh.param<int>("pcd_save/max_queued_points", queued_points, 200000);
-        nh.param<double>("pcd_save/keyframe_translation", keyframe_options.translation, 0.75);
-        nh.param<double>("pcd_save/keyframe_rotation_deg", keyframe_options.rotation_deg, 10.0);
-        nh.param<double>("pcd_save/keyframe_max_interval", keyframe_options.max_interval, 2.0);
         if (active_tiles < 1 || queued_points < 1)
         {
             ROS_FATAL("Lightweight map tile and queue limits must be positive");
@@ -1105,7 +1114,6 @@ int main(int argc, char** argv)
         options.max_queued_points = static_cast<size_t>(queued_points);
         try
         {
-            save_keyframe_selector.reset(new MapSaveKeyframe(keyframe_options));
             tiled_map_writer.reset(new TiledVoxelMapWriter(map_file_path, options));
             downSizeFilterSave.setLeafSize(options.voxel_size, options.voxel_size, options.voxel_size);
         }
@@ -1373,7 +1381,11 @@ int main(int argc, char** argv)
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. pcd save will largely influence the real-time performences **/
-    if (tiled_map_writer)
+    if (map_save_failed)
+    {
+        ROS_ERROR("Map or keyframe pose saving failed; keeping recovery checkpoints without replacing final files");
+    }
+    else if (tiled_map_writer)
     {
         try
         {
@@ -1400,11 +1412,28 @@ int main(int argc, char** argv)
         catch (const std::exception& error)
         {
             ROS_ERROR("Map finalization failed: %s; recover checkpoint at %s", error.what(), pcd_stream->workingPath().c_str());
+            map_save_failed = true;
         }
     }
     else if (pcl_wait_save->size() > 0 && pcd_save_en)
     {
-        save_accumulated_map(map_file_path);
+        if (!save_accumulated_map(map_file_path)) map_save_failed = true;
+    }
+    if (keyframe_pose_writer && !map_save_failed)
+    {
+        try
+        {
+            keyframe_pose_writer->finalize();
+            if (keyframe_pose_writer->count())
+                ROS_INFO("Saved %llu keyframe LiDAR poses to %s and %s",
+                         static_cast<unsigned long long>(keyframe_pose_writer->count()),
+                         keyframe_pose_writer->trajectoryPath().c_str(), keyframe_pose_writer->posesPath().c_str());
+        }
+        catch (const std::exception& error)
+        {
+            ROS_ERROR("Keyframe pose finalization failed: %s", error.what());
+            map_save_failed = true;
+        }
     }
 
     fout_out.close();

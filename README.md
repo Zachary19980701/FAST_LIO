@@ -13,6 +13,21 @@
 2. 播放数据包 `rosbag play your_bag.bag`
 3. 启动veledyne模式进行fastlio进行建图 `roslaunch fast_lio mapping_velodyne.launch`
 
+开启 `pcd_save/pcd_save_en` 后，正常退出时会在 `map_file_path` 的同一目录保存
+`trajectory.pcd` 和 `keyframe_poses.tum`。前者为标准二进制 XYZI PCD，XYZ 是关键帧
+LiDAR 原点在 `camera_init` 地图坐标系中的位置，intensity 为从 0 开始的关键帧编号，
+可供 `hr_location_ros1` 读取；后者每行是 `timestamp tx ty tz qx qy qz qw`，记录同一批
+关键帧的完整 LiDAR 位姿，时间为扫描结束时的采集时间，已计入 LiDAR–IMU 外参。
+
+关键帧阈值为 `pcd_save/keyframe_translation`（默认 0.75 m）、
+`pcd_save/keyframe_rotation_deg`（默认 10°）和 `pcd_save/keyframe_max_interval`
+（默认 2 s，需至少移动 0.1 m 或旋转 2°）。轻量保存模式中位姿与入图关键帧一一对应；
+传统模式逐帧保存地图，按上述阈值保存关键帧位姿。分段保存时，位姿文件覆盖本次运行的全部分段。
+位姿随关键帧流式写入磁盘，运行期间的恢复文件为
+`trajectory.pcd.in_progress.<PID>.pcd` 和 `keyframe_poses.tum.in_progress.<PID>`；
+地图成功导出后才改为最终文件名。空运行保留已有文件。不同建图任务应使用各自的输出目录，
+因为同目录下的不同地图文件共享这两个位姿文件名。
+
 
 
 
