@@ -59,9 +59,13 @@
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 #include <geometry_msgs/Vector3.h>
+#include <std_srvs/Trigger.h>
 #include <livox_ros_driver/CustomMsg.h>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+#include "pcd_stream_writer.h"
+#include "tiled_voxel_map_writer.h"
+#include "map_save_keyframe.h"
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -97,6 +101,16 @@ int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudVal
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool   map_pub_en = true;
+double map_publish_period = 1.0;
+double last_processed_stamp = 0.0;
+double max_point_range = 0.0, last_mapping_time_ms = 0.0;
+bool lightweight_save_en = false;
+bool map_save_failed = false;
+uint64_t save_keyframes = 0, save_skipped_frames = 0;
+int max_lidar_buffer = 20, max_imu_buffer = 4000;
+int lidar_sub_queue_size = 10, imu_sub_queue_size = 2000;
+uint64_t dropped_lidar_frames = 0, dropped_imu_messages = 0, processed_frames = 0;
 int lidar_type;
 
 vector<vector<int>>  pointSearchInd_surf; 
@@ -119,6 +133,7 @@ PointCloudXYZI::Ptr _featsArray;
 
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
+pcl::VoxelGrid<PointType> downSizeFilterSave;
 
 KD_TREE<PointType> ikdtree;
 
@@ -279,7 +294,22 @@ void lasermap_fov_segment()
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
-void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg) 
+void enqueue_lidar(const PointCloudXYZI::Ptr& cloud, double stamp)
+{
+    if (lidar_buffer.size() >= static_cast<size_t>(max_lidar_buffer))
+    {
+        lidar_buffer.pop_front();
+        time_buffer.pop_front();
+        lidar_pushed = false;
+        ++dropped_lidar_frames;
+        ROS_WARN_THROTTLE(2.0, "FAST-LIO input overloaded: oldest lidar frame dropped; total=%llu, limit=%d. Reduce playback rate.",
+                          static_cast<unsigned long long>(dropped_lidar_frames), max_lidar_buffer);
+    }
+    lidar_buffer.push_back(cloud);
+    time_buffer.push_back(stamp);
+}
+
+void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 {
     mtx_buffer.lock();
     scan_count ++;
@@ -295,14 +325,15 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
     {
         ROS_ERROR("lidar loop back, clear buffer");
         lidar_buffer.clear();
+        time_buffer.clear();
+        lidar_pushed = false;
     }
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
-    lidar_buffer.push_back(ptr);
-    time_buffer.push_back(msg->header.stamp.toSec());
+    enqueue_lidar(ptr, msg->header.stamp.toSec());
     last_timestamp_lidar = msg->header.stamp.toSec();
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    if (scan_count < MAXN) s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     
     // Processing stats
     ROS_INFO_STREAM("[Standard LIDAR CB] Done: "
@@ -332,6 +363,8 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
     {
         ROS_ERROR("lidar loop back, clear buffer");
         lidar_buffer.clear();
+        time_buffer.clear();
+        lidar_pushed = false;
     }
     last_timestamp_lidar = msg->header.stamp.toSec();
     
@@ -350,10 +383,9 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
-    lidar_buffer.push_back(ptr);
-    time_buffer.push_back(last_timestamp_lidar);
+    enqueue_lidar(ptr, last_timestamp_lidar);
     
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    if (scan_count < MAXN) s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     
     // Processing stats
     ROS_INFO_STREAM("[Livox LIDAR CB] Done: "
@@ -402,6 +434,13 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
     last_timestamp_imu = timestamp;
 
     imu_buffer.push_back(msg);
+    if (imu_buffer.size() > static_cast<size_t>(max_imu_buffer))
+    {
+        imu_buffer.pop_front();
+        ++dropped_imu_messages;
+        ROS_WARN_THROTTLE(2.0, "FAST-LIO IMU buffer full: oldest sample dropped; total=%llu. Reduce playback rate.",
+                          static_cast<unsigned long long>(dropped_imu_messages));
+    }
     
     // IMU buffer status output
     ROS_INFO_STREAM("[IMU CB] Stored to buffer: "
@@ -455,13 +494,22 @@ bool sync_packages(MeasureGroup &meas)
         return false;
     }
 
-    /*** push imu data, and pop from imu buffer ***/
-    double imu_time = imu_buffer.front()->header.stamp.toSec();
-    meas.imu.clear();
-    while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
+    if (imu_buffer.front()->header.stamp.toSec() > lidar_end_time)
     {
-        imu_time = imu_buffer.front()->header.stamp.toSec();
-        if(imu_time > lidar_end_time) break;
+        // IMU overflow or a stream gap removed this scan's entire interval.
+        // Do not reuse the previous frame's undistorted cloud with an empty IMU batch.
+        lidar_buffer.pop_front();
+        time_buffer.pop_front();
+        lidar_pushed = false;
+        ++dropped_lidar_frames;
+        ROS_WARN_THROTTLE(2.0, "Lidar frame skipped because its IMU interval is missing; reduce playback rate");
+        return false;
+    }
+
+    /*** push imu data, and pop from imu buffer ***/
+    meas.imu.clear();
+    while (!imu_buffer.empty() && imu_buffer.front()->header.stamp.toSec() <= lidar_end_time)
+    {
         meas.imu.push_back(imu_buffer.front());
         imu_buffer.pop_front();
     }
@@ -524,6 +572,140 @@ void map_incremental()
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
+std::unique_ptr<PcdStreamWriter<PointType>> pcd_stream;
+std::unique_ptr<TiledVoxelMapWriter> tiled_map_writer;
+std::unique_ptr<MapSaveKeyframe> save_keyframe_selector;
+
+void save_lightweight_map_frame()
+{
+    try
+    {
+        if (!save_keyframe_selector->select(pos_lid, Eigen::Quaterniond(state_point.rot.toRotationMatrix()), lidar_end_time))
+        {
+            ++save_skipped_frames;
+            return;
+        }
+        PointCloudXYZI sampled;
+        downSizeFilterSave.setInputCloud(feats_undistort);
+        downSizeFilterSave.filter(sampled);
+        pcl::PointCloud<pcl::PointXYZI>::Ptr world(new pcl::PointCloud<pcl::PointXYZI>());
+        world->reserve(sampled.size());
+        const M3D rotation = state_point.rot.toRotationMatrix() * state_point.offset_R_L_I.toRotationMatrix();
+        const V3D translation = state_point.rot * state_point.offset_T_L_I + state_point.pos;
+        for (const auto& point : sampled)
+        {
+            const V3D transformed = rotation * V3D(point.x, point.y, point.z) + translation;
+            pcl::PointXYZI output;
+            output.x = transformed.x();
+            output.y = transformed.y();
+            output.z = transformed.z();
+            output.intensity = point.intensity;
+            world->push_back(output);
+        }
+        // Only selected, downsampled scans enter the bounded writer queue.
+        tiled_map_writer->append(world);
+        ++save_keyframes;
+    }
+    catch (const std::exception& error)
+    {
+        ROS_FATAL("Lightweight map save failed: %s; preserving tile checkpoints", error.what());
+        map_save_failed = true;
+        flg_exit = true;
+    }
+}
+
+bool save_accumulated_map(const string &file_path)
+{
+    try
+    {
+        pcl::PCDWriter writer;
+        if (writer.writeBinary(file_path, *pcl_wait_save) < 0)
+        {
+            ROS_ERROR("Failed to save map to %s", file_path.c_str());
+            return false;
+        }
+        ROS_INFO("Saved %zu map points to %s", pcl_wait_save->size(), file_path.c_str());
+        return true;
+    }
+    catch (const std::exception &error)
+    {
+        ROS_ERROR("Failed to save map to %s: %s", file_path.c_str(), error.what());
+        return false;
+    }
+}
+
+bool processing_state(std_srvs::Trigger::Request&, std_srvs::Trigger::Response& response)
+{
+    const auto save_stats = tiled_map_writer ? tiled_map_writer->stats() : TiledVoxelMapWriter::Stats{};
+    std::ostringstream text;
+    text << std::setprecision(17)
+         << "{\"received_frames\":" << scan_count
+         << ",\"processed_frames\":" << processed_frames
+         << ",\"lidar_buffer\":" << lidar_buffer.size()
+         << ",\"lidar_time_buffer\":" << time_buffer.size()
+         << ",\"oldest_pending_stamp\":" << (time_buffer.empty() ? 0.0 : time_buffer.front())
+         << ",\"imu_buffer\":" << imu_buffer.size()
+         << ",\"dropped_lidar_frames\":" << dropped_lidar_frames
+         << ",\"dropped_imu_messages\":" << dropped_imu_messages
+         << ",\"last_received_stamp\":" << last_timestamp_lidar
+         << ",\"last_processed_stamp\":" << last_processed_stamp
+         << ",\"local_map_points\":" << ikdtree.validnum()
+         << ",\"local_map_nodes\":" << ikdtree.size()
+         << ",\"last_mapping_time_ms\":" << last_mapping_time_ms
+         << ",\"lightweight_save\":" << (tiled_map_writer ? "true" : "false")
+         << ",\"saved_points\":" << (tiled_map_writer ? save_stats.unique_points : (pcd_stream ? pcd_stream->count() : pcl_wait_save->size()))
+         << ",\"save_keyframes\":" << save_keyframes
+         << ",\"save_skipped_frames\":" << save_skipped_frames
+         << ",\"save_queued_points\":" << save_stats.queued_points
+         << ",\"save_cache_points\":" << save_stats.cache_points
+         << ",\"save_active_tiles\":" << save_stats.active_tiles
+         << ",\"save_backpressure_waits\":" << save_stats.backpressure_waits
+         << ",\"save_failed\":" << ((map_save_failed || save_stats.failed) ? "true" : "false")
+         // Payload bytes, excluding allocator/hash-table overhead and disk tiles.
+         << ",\"save_buffer_bytes\":" << (tiled_map_writer ? (save_stats.queued_points + save_stats.cache_points) * sizeof(pcl::PointXYZI) : (pcd_stream ? pcd_stream->bufferBytes() : pcl_wait_save->points.capacity() * sizeof(PointType)))
+         << "}";
+    response.success = true;
+    response.message = text.str();
+    return true;
+}
+
+bool save_map_checkpoint(std_srvs::Trigger::Request&, std_srvs::Trigger::Response& response)
+{
+    if (tiled_map_writer)
+    {
+        try
+        {
+            response.message = tiled_map_writer->checkpoint();
+            response.success = tiled_map_writer->stats().unique_points > 0;
+            if (!response.success) response.message = "No lightweight map points are available yet";
+        }
+        catch (const std::exception& error)
+        {
+            response.success = false;
+            response.message = error.what();
+        }
+        return true;
+    }
+    if (!pcd_stream || !pcd_stream->count())
+    {
+        response.success = false;
+        response.message = "No streaming map points are available yet";
+        return true;
+    }
+    try
+    {
+        pcd_stream->checkpoint();
+        response.success = true;
+        response.message = pcd_stream->workingPath();
+    }
+    catch (const std::exception& error)
+    {
+        response.success = false;
+        response.message = error.what();
+    }
+    return true;
+}
+
 void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
 {
     if(scan_pub_en)
@@ -552,6 +734,11 @@ void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
     /* 2. noted that pcd save will influence the real-time performences **/
     if (pcd_save_en)
     {
+        if (tiled_map_writer)
+        {
+            save_lightweight_map_frame();
+            return;
+        }
         int size = feats_undistort->points.size();
         PointCloudXYZI::Ptr laserCloudWorld( \
                         new PointCloudXYZI(size, 1));
@@ -561,6 +748,19 @@ void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
             RGBpointBodyToWorld(&feats_undistort->points[i], \
                                 &laserCloudWorld->points[i]);
         }
+        if (pcd_stream)
+        {
+            try
+            {
+                pcd_stream->append(*laserCloudWorld);
+            }
+            catch (const std::exception& error)
+            {
+                ROS_FATAL("Streaming map save failed: %s; stopping processing to preserve the last checkpoint", error.what());
+                flg_exit = true;
+            }
+            return;
+        }
         *pcl_wait_save += *laserCloudWorld;
 
         static int scan_wait_num = 0;
@@ -568,12 +768,16 @@ void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
         if (pcl_wait_save->size() > 0 && pcd_save_interval > 0  && scan_wait_num >= pcd_save_interval)
         {
             pcd_index ++;
-            string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
-            pcl::PCDWriter pcd_writer;
-            cout << "current scan saved to /PCD/" << all_points_dir << endl;
-            pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
-            pcl_wait_save->clear();
-            scan_wait_num = 0;
+            string prefix = map_file_path;
+            const size_t dot = prefix.find_last_of('.');
+            const size_t slash = prefix.find_last_of('/');
+            if (dot != string::npos && (slash == string::npos || dot > slash)) prefix.resize(dot);
+            const string file_path = prefix + "_" + to_string(pcd_index) + ".pcd";
+            if (save_accumulated_map(file_path))
+            {
+                pcl_wait_save.reset(new PointCloudXYZI());
+                scan_wait_num = 0;
+            }
         }
     }
 }
@@ -615,11 +819,22 @@ void publish_effect_world(const ros::Publisher & pubLaserCloudEffect)
 
 void publish_map(const ros::Publisher & pubLaserCloudMap)
 {
+    static ros::WallTime last_publish;
+    const ros::WallTime now = ros::WallTime::now();
+    if (!map_pub_en || pubLaserCloudMap.getNumSubscribers() == 0 ||
+        (!last_publish.isZero() && (now - last_publish).toSec() < map_publish_period)) return;
+    PointVector().swap(ikdtree.PCL_Storage);
+    ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+    featsFromMap->points.swap(ikdtree.PCL_Storage);
+    featsFromMap->height = 1;
+    featsFromMap->width = featsFromMap->size();
     sensor_msgs::PointCloud2 laserCloudMap;
     pcl::toROSMsg(*featsFromMap, laserCloudMap);
     laserCloudMap.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudMap.header.frame_id = "camera_init";
     pubLaserCloudMap.publish(laserCloudMap);
+    last_publish = now;
+    PointVector().swap(featsFromMap->points);
 }
 
 template<typename T>
@@ -809,13 +1024,28 @@ int main(int argc, char** argv)
     // 初始化ros节点
     ros::init(argc, argv, "laserMapping");
     ros::NodeHandle nh;
+    ros::NodeHandle private_nh("~");
+
     // 初始化ros参数
     nh.param<bool>("publish/path_en",path_en, true);
     nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
     nh.param<bool>("publish/dense_publish_en",dense_pub_en, true);
     nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en, true);
+    nh.param<bool>("publish/map_publish_en", map_pub_en, true);
+    nh.param<double>("publish/map_publish_period", map_publish_period, 1.0);
+    nh.param<int>("buffers/max_lidar_frames", max_lidar_buffer, 20);
+    nh.param<int>("buffers/max_imu_messages", max_imu_buffer, 4000);
+    nh.param<int>("buffers/lidar_sub_queue_size", lidar_sub_queue_size, 10);
+    nh.param<int>("buffers/imu_sub_queue_size", imu_sub_queue_size, 2000);
+    if (max_lidar_buffer < 1 || max_imu_buffer < 1 || lidar_sub_queue_size < 1 || imu_sub_queue_size < 1 ||
+        !std::isfinite(map_publish_period) || map_publish_period <= 0)
+    {
+        ROS_FATAL("Buffer limits must be positive; map_publish_period must be finite and > 0");
+        return 1;
+    }
     nh.param<int>("max_iteration",NUM_MAX_ITERATIONS,4);
-    nh.param<string>("map_file_path",map_file_path,"");
+    nh.param<string>("map_file_path",map_file_path, string(ROOT_DIR) + "PCD/scans.pcd");
+    if (map_file_path.empty()) map_file_path = string(ROOT_DIR) + "PCD/scans.pcd";
     nh.param<string>("common/lid_topic",lid_topic,"/livox/lidar");
     nh.param<string>("common/imu_topic", imu_topic,"/livox/imu");
     nh.param<bool>("common/time_sync_en", time_sync_en, false);
@@ -825,6 +1055,18 @@ int main(int argc, char** argv)
     nh.param<double>("filter_size_map",filter_size_map_min,0.5);
     nh.param<double>("cube_side_length",cube_len,200);
     nh.param<float>("mapping/det_range",DET_RANGE,300.f);
+    nh.param<double>("mapping/max_point_range",max_point_range,0.0);
+    if (!std::isfinite(filter_size_surf_min) || filter_size_surf_min <= 0.0 ||
+        !std::isfinite(filter_size_map_min) || filter_size_map_min <= 0.0 ||
+        !std::isfinite(cube_len) || cube_len <= 0.0 ||
+        !std::isfinite(DET_RANGE) || DET_RANGE <= 0.0 ||
+        !std::isfinite(max_point_range) || max_point_range < 0.0)
+    {
+        ROS_FATAL("Voxel sizes, cube length and detection range must be finite and positive; max_point_range may also be zero (disabled)");
+        return 1;
+    }
+    if (cube_len <= 2.0 * MOV_THRESHOLD * DET_RANGE)
+        ROS_WARN("cube_side_length should exceed %.1f m for det_range=%.1f; the local map can otherwise shift every scan", 2.0 * MOV_THRESHOLD * DET_RANGE, DET_RANGE);
     nh.param<double>("mapping/fov_degree",fov_deg,180);
     nh.param<double>("mapping/gyr_cov",gyr_cov,0.1);
     nh.param<double>("mapping/acc_cov",acc_cov,0.1);
@@ -841,6 +1083,43 @@ int main(int argc, char** argv)
     nh.param<bool>("mapping/extrinsic_est_en", extrinsic_est_en, true);
     nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
+    nh.param<bool>("pcd_save/lightweight_en", lightweight_save_en, false);
+    if (pcd_save_en && lightweight_save_en)
+    {
+        TiledVoxelMapWriter::Options options;
+        MapSaveKeyframe::Options keyframe_options;
+        int active_tiles = 16, queued_points = 200000;
+        nh.param<double>("pcd_save/voxel_size", options.voxel_size, 0.25);
+        nh.param<double>("pcd_save/tile_size", options.tile_size, 10.0);
+        nh.param<int>("pcd_save/max_active_tiles", active_tiles, 16);
+        nh.param<int>("pcd_save/max_queued_points", queued_points, 200000);
+        nh.param<double>("pcd_save/keyframe_translation", keyframe_options.translation, 0.75);
+        nh.param<double>("pcd_save/keyframe_rotation_deg", keyframe_options.rotation_deg, 10.0);
+        nh.param<double>("pcd_save/keyframe_max_interval", keyframe_options.max_interval, 2.0);
+        if (active_tiles < 1 || queued_points < 1)
+        {
+            ROS_FATAL("Lightweight map tile and queue limits must be positive");
+            return 1;
+        }
+        options.max_active_tiles = static_cast<size_t>(active_tiles);
+        options.max_queued_points = static_cast<size_t>(queued_points);
+        try
+        {
+            save_keyframe_selector.reset(new MapSaveKeyframe(keyframe_options));
+            tiled_map_writer.reset(new TiledVoxelMapWriter(map_file_path, options));
+            downSizeFilterSave.setLeafSize(options.voxel_size, options.voxel_size, options.voxel_size);
+        }
+        catch (const std::exception& error)
+        {
+            ROS_FATAL("Cannot initialize lightweight map saving: %s", error.what());
+            return 1;
+        }
+        ROS_INFO("Lightweight map: voxel=%.3f m, keyframe=%.2f m / %.1f deg, tile=%.2f m, cache=%d tiles, queue=%d points; checkpoints: %s",
+                 options.voxel_size, keyframe_options.translation, keyframe_options.rotation_deg,
+                 tiled_map_writer->normalizedTileSize(), active_tiles, queued_points, tiled_map_writer->workingPath().c_str());
+        if (pcd_save_interval > 0) ROS_WARN("pcd_save/interval is ignored in lightweight mode; spatial tiles provide checkpoints");
+    }
+    else if (pcd_save_en && pcd_save_interval <= 0) pcd_stream.reset(new PcdStreamWriter<PointType>(map_file_path));
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
     
@@ -896,29 +1175,39 @@ int main(int argc, char** argv)
 
     /*** ROS subscribe initialization ***/
     ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? \
-        nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : \
-        nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
-    ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
+        nh.subscribe(lid_topic, lidar_sub_queue_size, livox_pcl_cbk) : \
+        nh.subscribe(lid_topic, lidar_sub_queue_size, standard_pcl_cbk);
+    ros::Subscriber sub_imu = nh.subscribe(imu_topic, imu_sub_queue_size, imu_cbk);
     ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>
-            ("/cloud_registered", 100000);
+            ("/cloud_registered", 2);
     ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>
-            ("/cloud_registered_body", 100000);
+            ("/cloud_registered_body", 2);
     ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>
-            ("/cloud_effected", 100000);
+            ("/cloud_effected", 2);
     ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>
-            ("/Laser_map", 100000);
+            ("/Laser_map", 1);
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry> 
-            ("/Odometry", 100000);
+            ("/Odometry", 100);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
-            ("/path", 100000);
+            ("/path", 1);
+    ros::ServiceServer state_service = private_nh.advertiseService("get_processing_state", processing_state);
+    ros::ServiceServer save_service = private_nh.advertiseService("save_map", save_map_checkpoint);
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
-    ros::Rate rate(5000);
+    // Keep processing shutdown even after rosbag stops publishing /clock.
+    ros::WallRate rate(1000);
     bool status = ros::ok();
     while (status)
     {
         if (flg_exit) break;
         ros::spinOnce();
+        if (tiled_map_writer && tiled_map_writer->stats().failed)
+        {
+            ROS_FATAL("Lightweight map writer failed; stopping to preserve tile checkpoints");
+            map_save_failed = true;
+            flg_exit = true;
+            break;
+        }
         if(sync_packages(Measures)) 
         {
             if (flg_first_scan)
@@ -942,7 +1231,22 @@ int main(int argc, char** argv)
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
-            if (feats_undistort->empty() || (feats_undistort == NULL))
+            // Filter after deskew so frame end times and IMU integration retain
+            // their original acquisition interval. det_range alone is not a
+            // radial input filter in FAST-LIO.
+            if (feats_undistort)
+            {
+                auto& points = feats_undistort->points;
+                const double range_squared = max_point_range * max_point_range;
+                points.erase(std::remove_if(points.begin(), points.end(), [&](const PointType& point) {
+                    const double distance_squared = double(point.x) * point.x + double(point.y) * point.y + double(point.z) * point.z;
+                    return !std::isfinite(distance_squared) || !std::isfinite(point.intensity) ||
+                           (max_point_range > 0.0 && distance_squared > range_squared);
+                }), points.end());
+                feats_undistort->width = points.size();
+                feats_undistort->height = 1;
+            }
+            if (!feats_undistort || feats_undistort->empty())
             {
                 ROS_WARN("No point, skip this scan!\n");
                 continue;
@@ -992,14 +1296,6 @@ int main(int argc, char** argv)
             fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
             <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< endl;
 
-            if(0) // If you need to see map point, change to "if(1)"
-            {
-                PointVector ().swap(ikdtree.PCL_Storage);
-                ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
-                featsFromMap->clear();
-                featsFromMap->points = ikdtree.PCL_Storage;
-            }
-
             pointSearchInd_surf.resize(feats_down_size);
             Nearest_Points.resize(feats_down_size);
             int  rematch_num = 0;
@@ -1034,7 +1330,10 @@ int main(int argc, char** argv)
             if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFull);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
             // publish_effect_world(pubLaserCloudEffect);
-            // publish_map(pubLaserCloudMap);
+            publish_map(pubLaserCloudMap);
+            last_processed_stamp = lidar_end_time;
+            ++processed_frames;
+            last_mapping_time_ms = (omp_get_wtime() - t0) * 1000.0;
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1074,13 +1373,38 @@ int main(int argc, char** argv)
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. pcd save will largely influence the real-time performences **/
-    if (pcl_wait_save->size() > 0 && pcd_save_en)
+    if (tiled_map_writer)
     {
-        string file_name = string("scans.pcd");
-        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
-        pcl::PCDWriter pcd_writer;
-        cout << "current scan saved to /PCD/" << file_name<<endl;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+        try
+        {
+            ROS_INFO("Draining lightweight map writer and exporting %s", map_file_path.c_str());
+            tiled_map_writer->finalize();
+            ROS_INFO("Saved %llu unique XYZI map points from %llu keyframes to %s; tile checkpoints: %s",
+                     static_cast<unsigned long long>(tiled_map_writer->stats().unique_points),
+                     static_cast<unsigned long long>(save_keyframes), map_file_path.c_str(),
+                     tiled_map_writer->workingPath().c_str());
+        }
+        catch (const std::exception& error)
+        {
+            ROS_ERROR("Lightweight map finalization failed: %s; recover tile checkpoints at %s", error.what(), tiled_map_writer->workingPath().c_str());
+            map_save_failed = true;
+        }
+    }
+    else if (pcd_stream && pcd_stream->count())
+    {
+        try
+        {
+            pcd_stream->finalize();
+            ROS_INFO("Saved %llu map points to %s", static_cast<unsigned long long>(pcd_stream->count()), map_file_path.c_str());
+        }
+        catch (const std::exception& error)
+        {
+            ROS_ERROR("Map finalization failed: %s; recover checkpoint at %s", error.what(), pcd_stream->workingPath().c_str());
+        }
+    }
+    else if (pcl_wait_save->size() > 0 && pcd_save_en)
+    {
+        save_accumulated_map(map_file_path);
     }
 
     fout_out.close();
@@ -1104,5 +1428,5 @@ int main(int argc, char** argv)
         fclose(fp2);
     }
 
-    return 0;
+    return map_save_failed ? 1 : 0;
 }

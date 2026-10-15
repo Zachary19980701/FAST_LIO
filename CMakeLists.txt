@@ -7,7 +7,8 @@ ADD_COMPILE_OPTIONS(-std=c++14 )
 ADD_COMPILE_OPTIONS(-std=c++14 )
 set( CMAKE_CXX_FLAGS "-std=c++14 -O3" )
 
-add_definitions(-DROOT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/\")
+set(FAST_LIO_RUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "Directory containing FAST-LIO Log and PCD folders")
+add_definitions(-DROOT_DIR=\"${FAST_LIO_RUNTIME_DIR}/\")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fexceptions" )
 set(CMAKE_CXX_STANDARD 14)
@@ -49,6 +50,7 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
   std_msgs
+  std_srvs
   pcl_ros
   tf
   livox_ros_driver
@@ -85,8 +87,24 @@ catkin_package(
 )
 
 add_executable(fastlio_mapping src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp)
+add_dependencies(fastlio_mapping ${catkin_EXPORTED_TARGETS} ${${PROJECT_NAME}_EXPORTED_TARGETS})
 target_link_libraries(fastlio_mapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES})
 target_include_directories(fastlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
+
+add_executable(fastlio_export_tiles src/export_map_tiles.cpp)
+target_link_libraries(fastlio_export_tiles ${PCL_LIBRARIES})
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(test_pcd_stream_writer test/test_pcd_stream_writer.cpp)
+  if(TARGET test_pcd_stream_writer)
+    target_link_libraries(test_pcd_stream_writer ${PCL_LIBRARIES})
+  endif()
+  catkin_add_gtest(test_map_save_keyframe test/test_map_save_keyframe.cpp)
+  catkin_add_gtest(test_tiled_voxel_map_writer test/test_tiled_voxel_map_writer.cpp)
+  if(TARGET test_tiled_voxel_map_writer)
+    target_link_libraries(test_tiled_voxel_map_writer ${PCL_LIBRARIES})
+  endif()
+endif()
 
 # livox
 add_executable(${PROJECT_NAME}_livox_to_liosam src/livox_to_liosam.cpp)
